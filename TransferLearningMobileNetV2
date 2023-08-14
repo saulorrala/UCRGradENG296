@@ -1,0 +1,140 @@
+% =========================================================================
+% Real-time Detection of Fetal Heart Rate Presence using MobileNetV2
+% =========================================================================
+clc;
+clear all;
+close all;
+
+% ------------------------ Load MobileNetV2 ------------------------
+% This model serves as a base for feature extraction.
+net = mobilenetv2;
+
+% ------------------------ Define Data Directories ------------------------
+% Base directory where audio data is stored. Each category should be a subfolder.
+baseDir = 'C:\Users\saul_\UCRGrad\ENG 296\DataSetPreProcessed\';
+categories = {'Fetal Heart Rate', 'Heart Rate Unidentified', 'Irregular Fetal Heart Rate'};
+
+% ------------------------ Prepare and Preprocess Data ------------------------
+% Split the dataset into training, validation, and test sets.
+[trainAds, valAds, testAds] = prepareData(baseDir, categories);
+
+% Extract spectrograms for each set. This converts audio data to an image format
+% that can be used by MobileNetV2.
+[trainFeatures, trainLabels] = extractSpectrogramsFromDatastore(net, trainAds);
+[valFeatures, valLabels] = extractSpectrogramsFromDatastore(net, valAds);
+[testFeatures, testLabels] = extractSpectrogramsFromDatastore(net, testAds);
+
+% ------------------------ Modify MobileNetV2 for Custom Classification ------------------------
+% We adapt MobileNetV2 to the new task by replacing its final layers.
+lgraph = modifyMobileNetV2ForClassification(net, numel(categories));
+
+% ------------------------ Train the Modified Network ------------------------
+options = trainingOptions('sgdm', ...
+                          'ValidationData', {valFeatures, valLabels}, ...
+                          'Plots', 'training-progress');
+MyTestNet = trainNetwork(trainFeatures, trainLabels, lgraph, options);
+% Evaluate on validation set
+disp('Evaluating on Validation Data...');
+testClassifier(MyTestNet, valFeatures, valLabels, categories, 'Validation');
+
+% ------------------------ Evaluate on Test Set ------------------------
+% This provides detailed metrics on how the trained model performs.
+testClassifier(MyTestNet, testFeatures, testLabels, categories, 'Test');
+
+% Save the trained model for future use.
+save('DetectFHRPresence.mat', 'MyTestNet');
+
+% ------------------------ Helper Functions ------------------------
+
+function [trainAds, valAds, testAds] = prepareData(baseDir, categories)
+    % This function prepares the data for training, validation, and testing.
+    
+    allAds = combineAndShuffleDatastores(baseDir, categories);
+    [trainAds, tempAds] = splitEachLabel(allAds, 0.8);
+    [valAds, testAds] = splitEachLabel(tempAds, 0.5);
+end
+
+function allAds = combineAndShuffleDatastores(baseDir, categories)
+    % This function combines and shuffles the datastores for all categories.
+    
+    allFiles = [];
+    allLabels = [];
+    for i = 1:length(categories)
+        ads = audioDatastore(fullfile(baseDir, categories{i}), 'LabelSource', 'foldernames', 'FileExtensions', '.wav');
+        allFiles = [allFiles; ads.Files];
+        allLabels = [allLabels; ads.Labels];
+    end
+    allAds = audioDatastore(allFiles, 'Labels', allLabels);
+    allAds = shuffle(allAds);
+end
+
+function [features, labels] = extractSpectrogramsFromDatastore(net, ads)
+    % Extracts Mel Spectrograms from the audio files and formats them for MobileNetV2.
+    
+    numFiles = numel(ads.Files);
+    inputSize = net.Layers(1).InputSize;
+    features = zeros([inputSize, numFiles]);
+    labels = categorical();
+    for i = 1:numFiles
+        [audioData, info] = read(ads);
+        melSpec = melSpectrogram(audioData, info.SampleRate, 'WindowLength', 256, 'OverlapLength', 128, 'FFTLength', 512, 'NumBands', 96);
+        melSpecResized = imresize(log(melSpec + 1e-6), inputSize(1:2));
+        melSpecImage = cat(3, melSpecResized, melSpecResized, melSpecResized);
+        features(:,:,:,i) = melSpecImage;
+        labels = [labels; ads.Labels(i)];
+    end
+end
+
+function lgraph = modifyMobileNetV2ForClassification(net, numCategories)
+    % Modifies MobileNetV2 to make it suitable for our custom classification task.
+    
+    lgraph = layerGraph(net);
+    layersToRemove = {'Logits', 'Logits_softmax', 'ClassificationLayer_Logits'};
+    lgraph = removeLayers(lgraph, layersToRemove);
+
+    newLayers = [
+        fullyConnectedLayer(numCategories, 'Name', 'new_fc', 'WeightLearnRateFactor', 10, 'BiasLearnRateFactor', 10);
+        softmaxLayer('Name', 'softmax');
+        classificationLayer('Name', 'new_classoutput')
+    ];
+    lgraph = addLayers(lgraph, newLayers);
+    lgraph = connectLayers(lgraph, 'global_average_pooling2d_1', 'new_fc');
+    return;
+end
+
+function testClassifier(net, features, labels, categories, dataSetType)
+    % Provides detailed metrics on the trained model's performance.
+    
+    predictions = classify(net, features);
+    accuracy = mean(predictions == labels);
+    disp("Test Data Accuracy: " + accuracy*100 + "%");
+    
+    % Plot confusion matrix and save it
+    fig = figure;
+    set(fig, 'Color', 'white'); % Set figure background to white
+    cm = confusionchart(labels, predictions);
+    title('Confusion Matrix for Test Data');
+   saveFigureToWordDoc(fig, ['ConfusionMatrix_' dataSetType]);
+
+    
+    % Display detailed metrics for each class
+    for cat = categories
+        tp = sum((predictions == cat) & (labels == cat));
+        fp = sum((predictions == cat) & (labels ~= cat));
+        fn = sum((predictions ~= cat) & (labels == cat));
+        precision = tp / (tp + fp);
+        recall = tp / (tp + fn);
+        f1 = 2 * (precision * recall) / (precision + recall);
+        disp(['Metrics for class ', char(cat), ':']);
+        disp(['Precision: ', num2str(precision), ', Recall: ', num2str(recall), ', F1-score: ', num2str(f1)]);
+    end
+end
+
+function saveFigureToWordDoc(fig, figName)
+    % Saves the given figure optimally for a Word document.
+    
+    savePath = uigetdir('', 'Choose where to save the figures');
+    if savePath ~= 0
+        saveas(fig, fullfile(savePath, [figName, '.png']));
+    end
+end
